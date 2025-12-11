@@ -10,6 +10,12 @@ import (
 	"trackr/internal/platform/config"
 )
 
+type TenantContext struct {
+	OrgID   string
+	OrgSlug string
+	DB      *sql.DB
+}
+
 type TenantDBPool struct {
 	pools  map[string]*sql.DB
 	mu     sync.RWMutex
