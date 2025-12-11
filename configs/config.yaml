@@ -1,0 +1,78 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 120s
+
+database:
+  global:
+    url: "file:trackr.db" # Defaulting to local sqlite for dev if turso is not available, or I should mock it. Plan says libsql.
+    auth_token: ""
+    max_connections: 25
+  tenant:
+    base_path: "./dbs"
+    max_connections_per_org: 25
+
+cache:
+  link_ttl: 5m
+  max_entries: 100000
+
+jwt:
+  secret: "your-secret-key-must-be-at-least-32-bytes-long"
+  access_token_ttl: 15m
+  refresh_token_ttl: 720h # 30 days
+
+cors:
+  allowed_origins:
+    - "https://app.trackr.io"
+    - "https://dashboard.trackr.io"
+  allowed_methods:
+    - GET
+    - POST
+    - PATCH
+    - DELETE
+  allowed_headers:
+    - Authorization
+    - Content-Type
+  max_age: 3600
+
+rate_limit:
+  redirect_per_minute: 10000
+  api_read_per_minute: 1000
+  api_write_per_minute: 100
+
+geoip:
+  database_path: "./geoip/GeoLite2-City.mmdb"
+
+webhooks:
+  worker_count: 10
+  retry_attempts: 3
+  retry_backoff: exponential # linear, exponential
+
+logging:
+  level: "info" # debug, info, warn, error
+  format: "json" # json, text
+  output: "stdout" # stdout, file
+  file_path: "./app.log"
+
+saml:
+  sp_entity_id: "https://trackr.io/saml/metadata"
+  sp_acs_url: "https://trackr.io/api/v1/auth/saml/acs"
+  sp_cert_path: "./saml/sp-cert.pem"
+  sp_key_path: "./saml/sp-key.pem"
+
+email:
+  provider: "smtp" # smtp, ses
+  smtp:
+    host: "smtp.sendgrid.net"
+    port: 587
+    username: "apikey"
+    password: ""
+    from_address: "noreply@trackr.io"
+    from_name: "Trackr"
+
+domains:
+  short_domain: "trk.io"
+  app_domain: "app.trackr.io"
+  api_domain: "api.trackr.io"
