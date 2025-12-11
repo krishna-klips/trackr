@@ -987,3 +987,1027 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     
     // 2. Query SQLite
     link := tenantDB.GetLinkByShort
+   ```go
+    link := tenantDB.GetLinkByShortCode(shortCode)
+    if link == nil {
+        http.NotFound(w, r)
+        return
+    }
+    
+    // 3. Update cache
+    linkCache.Set(shortCode, link)
+    
+    // 4. Redirect
+    h.redirect(w, r, link)
+}
+```
+
+#### Rules Engine
+```go
+type RedirectRules struct {
+    Geo    map[string]string `json:"geo"`    // {"US": "https://...", "GB": "..."}
+    Device map[string]string `json:"device"` // {"ios": "...", "android": "..."}
+    Time   *TimeRule         `json:"time"`   // Business hours routing
+}
+
+type TimeRule struct {
+    Timezone string            `json:"timezone"`
+    Rules    map[string]string `json:"rules"` // {"weekday": "...", "weekend": "..."}
+}
+
+func (r *RedirectRules) Evaluate(ctx *RequestContext) string {
+    // Priority: Device > Geo > Time > Default
+    
+    // 1. Device-based routing
+    if r.Device != nil {
+        if url, ok := r.Device[ctx.DeviceType]; ok {
+            return url
+        }
+    }
+    
+    // 2. Geo-based routing
+    if r.Geo != nil {
+        if url, ok := r.Geo[ctx.CountryCode]; ok {
+            return url
+        }
+    }
+    
+    // 3. Time-based routing
+    if r.Time != nil {
+        url := r.evaluateTimeRule(ctx.RequestTime)
+        if url != "" {
+            return url
+        }
+    }
+    
+    // 4. Default destination
+    return ""
+}
+
+type RequestContext struct {
+    IPAddress   string
+    UserAgent   string
+    CountryCode string
+    DeviceType  string
+    OS          string
+    Browser     string
+    Referrer    string
+    RequestTime time.Time
+}
+
+func buildRequestContext(r *http.Request) *RequestContext {
+    ip := extractIP(r)
+    ua := r.UserAgent()
+    
+    return &RequestContext{
+        IPAddress:   ip,
+        UserAgent:   ua,
+        CountryCode: geoip.Lookup(ip),
+        DeviceType:  parseDeviceType(ua),
+        OS:          parseOS(ua),
+        Browser:     parseBrowser(ua),
+        Referrer:    r.Referer(),
+        RequestTime: time.Now(),
+    }
+}
+```
+
+#### Async Click Logging
+```go
+func (h *RedirectHandler) redirect(w http.ResponseWriter, r *http.Request, link *Link) {
+    ctx := buildRequestContext(r)
+    
+    // Evaluate rules
+    finalURL := link.DestinationURL
+    if link.Rules != nil {
+        if ruleURL := link.Rules.Evaluate(ctx); ruleURL != "" {
+            finalURL = ruleURL
+        }
+    }
+    
+    // Apply UTM parameters
+    finalURL = applyUTMParams(finalURL, link.DefaultUTMParams, r.URL.Query())
+    
+    // Fire-and-forget click logging (non-blocking)
+    go func() {
+        click := &Click{
+            ID:             generateUUID(),
+            LinkID:         link.ID,
+            ShortCode:      link.ShortCode,
+            Timestamp:      time.Now().UnixMilli(),
+            IPAddress:      ctx.IPAddress,
+            UserAgent:      ctx.UserAgent,
+            CountryCode:    ctx.CountryCode,
+            City:           geoip.LookupCity(ctx.IPAddress),
+            DeviceType:     ctx.DeviceType,
+            OS:             ctx.OS,
+            Browser:        ctx.Browser,
+            Referrer:       ctx.Referrer,
+            ReferrerDomain: extractDomain(ctx.Referrer),
+            UTMSource:      r.URL.Query().Get("utm_source"),
+            UTMMedium:      r.URL.Query().Get("utm_medium"),
+            UTMCampaign:    r.URL.Query().Get("utm_campaign"),
+            DestinationURL: finalURL,
+        }
+        
+        if err := clickRepo.Insert(click); err != nil {
+            logger.Error("Failed to log click", "error", err)
+        }
+        
+        // Update denormalized click count
+        linkRepo.IncrementClickCount(link.ID)
+        
+        // Trigger webhooks
+        webhookDispatcher.Dispatch("click.created", click)
+    }()
+    
+    // Issue redirect
+    status := http.StatusFound // 302
+    if link.RedirectType == "permanent" {
+        status = http.StatusMovedPermanently // 301
+    }
+    
+    http.Redirect(w, r, finalURL, status)
+}
+```
+
+---
+
+### 5.4 Short Code Generation
+
+```go
+const (
+    shortCodeChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    shortCodeLength = 7 // Default length
+)
+
+func GenerateShortCode(customCode string, linkRepo *LinkRepository) (string, error) {
+    // Use custom code if provided
+    if customCode != "" {
+        if !isValidShortCode(customCode) {
+            return "", errors.New("invalid short code format")
+        }
+        
+        // Check availability
+        exists := linkRepo.ExistsByShortCode(customCode)
+        if exists {
+            return "", errors.New("short code already taken")
+        }
+        
+        return customCode, nil
+    }
+    
+    // Generate random code with collision retry
+    maxRetries := 5
+    for i := 0; i < maxRetries; i++ {
+        code := generateRandomCode(shortCodeLength)
+        
+        exists := linkRepo.ExistsByShortCode(code)
+        if !exists {
+            return code, nil
+        }
+    }
+    
+    // If collisions persist, increase length
+    return generateRandomCode(shortCodeLength + 1), nil
+}
+
+func generateRandomCode(length int) string {
+    b := make([]byte, length)
+    for i := range b {
+        b[i] = shortCodeChars[rand.Intn(len(shortCodeChars))]
+    }
+    return string(b)
+}
+
+func isValidShortCode(code string) bool {
+    if len(code) < 3 || len(code) > 12 {
+        return false
+    }
+    
+    // Only alphanumeric
+    for _, c := range code {
+        if !strings.ContainsRune(shortCodeChars, c) {
+            return false
+        }
+    }
+    
+    // Reserved codes
+    reserved := []string{"api", "admin", "dashboard", "login", "signup", "health"}
+    for _, r := range reserved {
+        if strings.EqualFold(code, r) {
+            return false
+        }
+    }
+    
+    return true
+}
+```
+
+---
+
+### 5.5 RBAC (Role-Based Access Control)
+
+```go
+type Permission string
+
+const (
+    // Link permissions
+    PermLinkCreate  Permission = "link:create"
+    PermLinkRead    Permission = "link:read"
+    PermLinkUpdate  Permission = "link:update"
+    PermLinkDelete  Permission = "link:delete"
+    
+    // Analytics permissions
+    PermAnalyticsRead Permission = "analytics:read"
+    
+    // Organization permissions
+    PermOrgUpdate   Permission = "org:update"
+    PermOrgDelete   Permission = "org:delete"
+    
+    // User management
+    PermUserInvite  Permission = "user:invite"
+    PermUserUpdate  Permission = "user:update"
+    PermUserDelete  Permission = "user:delete"
+    
+    // Webhook permissions
+    PermWebhookManage Permission = "webhook:manage"
+)
+
+var rolePermissions = map[string][]Permission{
+    "member": {
+        PermLinkCreate,
+        PermLinkRead,
+        PermLinkUpdate, // Own links only
+        PermLinkDelete, // Own links only
+        PermAnalyticsRead,
+    },
+    "admin": {
+        PermLinkCreate,
+        PermLinkRead,
+        PermLinkUpdate, // All links
+        PermLinkDelete, // All links
+        PermAnalyticsRead,
+        PermUserInvite,
+        PermWebhookManage,
+    },
+    "owner": {
+        // All permissions
+        PermLinkCreate,
+        PermLinkRead,
+        PermLinkUpdate,
+        PermLinkDelete,
+        PermAnalyticsRead,
+        PermOrgUpdate,
+        PermOrgDelete,
+        PermUserInvite,
+        PermUserUpdate,
+        PermUserDelete,
+        PermWebhookManage,
+    },
+}
+
+func HasPermission(role string, permission Permission) bool {
+    perms, ok := rolePermissions[role]
+    if !ok {
+        return false
+    }
+    
+    for _, p := range perms {
+        if p == permission {
+            return true
+        }
+    }
+    return false
+}
+
+// Middleware
+func RequirePermission(perm Permission) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            claims := r.Context().Value("claims").(*Claims)
+            
+            if !HasPermission(claims.Role, perm) {
+                http.Error(w, "Forbidden", http.StatusForbidden)
+                return
+            }
+            
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+
+// Resource ownership check
+func CanModifyLink(claims *Claims, link *Link) bool {
+    // Owner/Admin can modify any link
+    if claims.Role == "owner" || claims.Role == "admin" {
+        return true
+    }
+    
+    // Members can only modify their own links
+    return link.CreatedBy == claims.UserID
+}
+```
+
+---
+
+### 5.6 Corporate Email Validation
+
+```go
+var blockedDomains = []string{
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
+    "aol.com", "icloud.com", "protonmail.com", "mail.com",
+    "zoho.com", "yandex.com", "gmx.com", "live.com",
+}
+
+func IsCorpoateEmail(email string) error {
+    parts := strings.Split(email, "@")
+    if len(parts) != 2 {
+        return errors.New("invalid email format")
+    }
+    
+    domain := strings.ToLower(parts[1])
+    
+    // Check against blocked list
+    for _, blocked := range blockedDomains {
+        if domain == blocked {
+            return errors.New("consumer email domains not allowed")
+        }
+    }
+    
+    // Additional validation: check MX records
+    mx, err := net.LookupMX(domain)
+    if err != nil || len(mx) == 0 {
+        return errors.New("invalid email domain")
+    }
+    
+    return nil
+}
+
+// Domain verification for auto-assignment
+func CheckDomainOwnership(orgID, domain string) (bool, error) {
+    // Expected TXT record: trackr-verify=<token>
+    txtRecords, err := net.LookupTXT(domain)
+    if err != nil {
+        return false, err
+    }
+    
+    expectedToken := getDomainVerificationToken(orgID, domain)
+    expectedRecord := "trackr-verify=" + expectedToken
+    
+    for _, record := range txtRecords {
+        if record == expectedRecord {
+            return true, nil
+        }
+    }
+    
+    return false, nil
+}
+```
+
+---
+
+### 5.7 Rate Limiting
+
+```go
+type RateLimiter struct {
+    store *sync.Map // map[string]*Bucket
+}
+
+type Bucket struct {
+    tokens     int
+    lastRefill time.Time
+    mu         sync.Mutex
+}
+
+// Per-organization rate limits
+var rateLimits = map[string]int{
+    "redirect":    10000, // 10k redirects per minute per org
+    "api_read":    1000,  // 1k API reads per minute
+    "api_write":   100,   // 100 API writes per minute
+    "analytics":   500,   // 500 analytics queries per minute
+}
+
+func (rl *RateLimiter) Allow(key string, limit int) bool {
+    now := time.Now()
+    
+    val, _ := rl.store.LoadOrStore(key, &Bucket{
+        tokens:     limit,
+        lastRefill: now,
+    })
+    
+    bucket := val.(*Bucket)
+    bucket.mu.Lock()
+    defer bucket.mu.Unlock()
+    
+    // Refill bucket (1 token per second)
+    elapsed := now.Sub(bucket.lastRefill)
+    refillTokens := int(elapsed.Seconds())
+    if refillTokens > 0 {
+        bucket.tokens = min(limit, bucket.tokens+refillTokens)
+        bucket.lastRefill = now
+    }
+    
+    // Check availability
+    if bucket.tokens > 0 {
+        bucket.tokens--
+        return true
+    }
+    
+    return false
+}
+
+func RateLimitMiddleware(limitType string) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            tenant := r.Context().Value("tenant").(*TenantContext)
+            key := fmt.Sprintf("%s:%s", tenant.OrgID, limitType)
+            limit := rateLimits[limitType]
+            
+            if !rateLimiter.Allow(key, limit) {
+                w.Header().Set("Retry-After", "60")
+                http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+                return
+            }
+            
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+```
+
+---
+
+### 5.8 Webhook System
+
+```go
+type WebhookEvent struct {
+    ID        string      `json:"id"`
+    Event     string      `json:"event"` // "click.created", "link.created"
+    Timestamp int64       `json:"timestamp"`
+    OrgID     string      `json:"org_id"`
+    Data      interface{} `json:"data"`
+}
+
+type WebhookDispatcher struct {
+    queue chan *WebhookJob
+}
+
+type WebhookJob struct {
+    Webhook *Webhook
+    Event   *WebhookEvent
+}
+
+func (d *WebhookDispatcher) Dispatch(eventType string, data interface{}) {
+    webhooks := webhookRepo.GetByEvent(eventType)
+    
+    event := &WebhookEvent{
+        ID:        generateUUID(),
+        Event:     eventType,
+        Timestamp: time.Now().Unix(),
+        Data:      data,
+    }
+    
+    for _, webhook := range webhooks {
+        d.queue <- &WebhookJob{
+            Webhook: webhook,
+            Event:   event,
+        }
+    }
+}
+
+func (d *WebhookDispatcher) Worker() {
+    for job := range d.queue {
+        d.deliver(job)
+    }
+}
+
+func (d *WebhookDispatcher) deliver(job *WebhookJob) {
+    payload, _ := json.Marshal(job.Event)
+    
+    // Generate HMAC signature
+    signature := generateHMAC(job.Webhook.Secret, payload)
+    
+    req, _ := http.NewRequest("POST", job.Webhook.URL, bytes.NewBuffer(payload))
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-Trackr-Signature", signature)
+    req.Header.Set("X-Trackr-Event", job.Event.Event)
+    req.Header.Set("X-Trackr-Delivery", job.Event.ID)
+    
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Do(req)
+    
+    if err != nil || resp.StatusCode >= 400 {
+        // Retry logic with exponential backoff
+        d.scheduleRetry(job)
+        webhookRepo.UpdateStatus(job.Webhook.ID, "failed")
+    } else {
+        webhookRepo.UpdateLastTriggered(job.Webhook.ID, time.Now().Unix())
+    }
+}
+
+func generateHMAC(secret string, payload []byte) string {
+    h := hmac.New(sha256.New, []byte(secret))
+    h.Write(payload)
+    return hex.EncodeToString(h.Sum(nil))
+}
+```
+
+---
+
+### 5.9 Analytics Aggregation
+
+```go
+// Background worker: runs daily at 00:00 UTC
+func DailyStatsAggregator() {
+    ticker := time.NewTicker(24 * time.Hour)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        aggregateYesterday()
+    }
+}
+
+func aggregateYesterday() {
+    yesterday := time.Now().Add(-24 * time.Hour).Format("2006-01-02")
+    
+    // Process each organization
+    orgs := orgRepo.GetAll()
+    for _, org := range orgs {
+        tenantDB := openSQLite(org.DBFilePath)
+        
+        links := linkRepo.GetAll(tenantDB)
+        for _, link := range links {
+            stats := computeDailyStats(tenantDB, link.ID, yesterday)
+            
+            dailyStatsRepo.Upsert(tenantDB, &DailyStats{
+                ID:           generateUUID(),
+                LinkID:       link.ID,
+                Date:         yesterday,
+                Clicks:       stats.Clicks,
+                UniqueIPs:    stats.UniqueIPs,
+                TopCountry:   stats.TopCountry,
+                TopReferrer:  stats.TopReferrer,
+                TopDevice:    stats.TopDevice,
+                CreatedAt:    time.Now().Unix(),
+            })
+        }
+    }
+}
+
+func computeDailyStats(db *sql.DB, linkID, date string) *Stats {
+    startTime := parseDate(date).Unix()
+    endTime := startTime + 86400 // 24 hours
+    
+    var stats Stats
+    
+    // Total clicks
+    db.QueryRow(`
+        SELECT COUNT(*) FROM clicks 
+        WHERE link_id = ? AND timestamp >= ? AND timestamp < ?
+    `, linkID, startTime*1000, endTime*1000).Scan(&stats.Clicks)
+    
+    // Unique IPs
+    db.QueryRow(`
+        SELECT COUNT(DISTINCT ip_address) FROM clicks 
+        WHERE link_id = ? AND timestamp >= ? AND timestamp < ?
+    `, linkID, startTime*1000, endTime*1000).Scan(&stats.UniqueIPs)
+    
+    // Top country
+    db.QueryRow(`
+        SELECT country_code FROM clicks 
+        WHERE link_id = ? AND timestamp >= ? AND timestamp < ?
+        GROUP BY country_code 
+        ORDER BY COUNT(*) DESC 
+        LIMIT 1
+    `, linkID, startTime*1000, endTime*1000).Scan(&stats.TopCountry)
+    
+    // Similar queries for TopReferrer, TopDevice...
+    
+    return &stats
+}
+```
+
+---
+
+### 5.10 QR Code Generation
+
+```go
+import "github.com/skip2/go-qrcode"
+
+func GenerateQRCode(shortURL string, size int) ([]byte, error) {
+    // Default size
+    if size == 0 {
+        size = 512
+    }
+    
+    // Validate size
+    if size < 128 || size > 2048 {
+        return nil, errors.New("invalid size: must be between 128 and 2048")
+    }
+    
+    // Generate QR code
+    qr, err := qrcode.New(shortURL, qrcode.Medium)
+    if err != nil {
+        return nil, err
+    }
+    
+    qr.DisableBorder = false
+    
+    // Return PNG bytes
+    return qr.PNG(size)
+}
+
+// Handler
+func (h *LinkHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
+    linkID := chi.URLParam(r, "link_id")
+    
+    link := linkRepo.GetByID(linkID)
+    if link == nil {
+        http.NotFound(w, r)
+        return
+    }
+    
+    shortURL := fmt.Sprintf("https://trk.io/%s", link.ShortCode)
+    
+    size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+    if size == 0 {
+        size = 512
+    }
+    
+    qrBytes, err := GenerateQRCode(shortURL, size)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    
+    w.Header().Set("Content-Type", "image/png")
+    w.Header().Set("Cache-Control", "public, max-age=31536000") // 1 year
+    w.Write(qrBytes)
+}
+```
+
+---
+
+## 6. CONFIGURATION
+
+### 6.1 Application Config (config.yaml)
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 120s
+
+database:
+  global:
+    url: "libsql://your-turso-db.turso.io"
+    auth_token: "${TURSO_AUTH_TOKEN}"
+    max_connections: 25
+  tenant:
+    base_path: "/var/lib/trackr/dbs"
+    max_connections_per_org: 25
+
+cache:
+  link_ttl: 5m
+  max_entries: 100000
+
+jwt:
+  secret: "${JWT_SECRET}"
+  access_token_ttl: 15m
+  refresh_token_ttl: 720h # 30 days
+
+cors:
+  allowed_origins:
+    - "https://app.trackr.io"
+    - "https://dashboard.trackr.io"
+  allowed_methods:
+    - GET
+    - POST
+    - PATCH
+    - DELETE
+  allowed_headers:
+    - Authorization
+    - Content-Type
+  max_age: 3600
+
+rate_limit:
+  redirect_per_minute: 10000
+  api_read_per_minute: 1000
+  api_write_per_minute: 100
+
+geoip:
+  database_path: "/var/lib/trackr/geoip/GeoLite2-City.mmdb"
+
+webhooks:
+  worker_count: 10
+  retry_attempts: 3
+  retry_backoff: exponential # linear, exponential
+
+logging:
+  level: "info" # debug, info, warn, error
+  format: "json" # json, text
+  output: "stdout" # stdout, file
+  file_path: "/var/log/trackr/app.log"
+
+saml:
+  sp_entity_id: "https://trackr.io/saml/metadata"
+  sp_acs_url: "https://trackr.io/api/v1/auth/saml/acs"
+  sp_cert_path: "/etc/trackr/saml/sp-cert.pem"
+  sp_key_path: "/etc/trackr/saml/sp-key.pem"
+
+email:
+  provider: "smtp" # smtp, ses
+  smtp:
+    host: "smtp.sendgrid.net"
+    port: 587
+    username: "apikey"
+    password: "${SENDGRID_API_KEY}"
+    from_address: "noreply@trackr.io"
+    from_name: "Trackr"
+
+domains:
+  short_domain: "trk.io"
+  app_domain: "app.trackr.io"
+  api_domain: "api.trackr.io"
+```
+
+---
+
+### 6.2 Caddyfile
+
+```caddy
+{
+    email admin@trackr.io
+    auto_https on
+}
+
+# Main application
+app.trackr.io {
+    reverse_proxy localhost:8080
+    
+    encode gzip
+    
+    log {
+        output file /var/log/caddy/app.log
+        format json
+    }
+}
+
+# API domain
+api.trackr.io {
+    reverse_proxy localhost:8080
+    
+    encode gzip
+    
+    # Rate limiting (via Caddy plugin if available)
+    
+    log {
+        output file /var/log/caddy/api.log
+        format json
+    }
+}
+
+# Short link domain (redirects)
+trk.io {
+    reverse_proxy localhost:8080
+    
+    # No gzip for redirects (performance)
+    
+    log {
+        output file /var/log/caddy/redirect.log
+        format json
+    }
+}
+
+# Wildcard for custom domains
+*.trackr.io {
+    reverse_proxy localhost:8080
+    
+    tls {
+        on_demand
+    }
+}
+```
+
+---
+
+## 7. SECURITY SPECIFICATIONS
+
+### 7.1 Password Requirements
+
+```go
+func ValidatePassword(password string) error {
+    if len(password) < 8 {
+        return errors.New("password must be at least 8 characters")
+    }
+    
+    var (
+        hasUpper   bool
+        hasLower   bool
+        hasNumber  bool
+        hasSpecial bool
+    )
+    
+    for _, char := range password {
+        switch {
+        case unicode.IsUpper(char):
+            hasUpper = true
+        case unicode.IsLower(char):
+            hasLower = true
+        case unicode.IsNumber(char):
+            hasNumber = true
+        case unicode.IsPunct(char) || unicode.IsSymbol(char):
+            hasSpecial = true
+        }
+    }
+    
+    if !hasUpper || !hasLower || !hasNumber || !hasSpecial {
+        return errors.New("password must contain uppercase, lowercase, number, and special character")
+    }
+    
+    return nil
+}
+```
+
+### 7.2 Password Hashing
+
+```go
+import "golang.org/x/crypto/bcrypt"
+
+func HashPassword(password string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+    return string(bytes), err
+}
+
+func CheckPassword(password, hash string) bool {
+    err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+    return err == nil
+}
+```
+
+### 7.3 API Key Format
+
+```
+Format: trk_{env}_{random}
+Examples:
+  - trk_live_abc123xyz789def456ghi789
+  - trk_test_xyz987wvu654tsr321qpo098
+
+Stored as SHA-256 hash in database.
+Display only first 8 chars: trk_live_abc*****
+```
+
+### 7.4 CORS Policy
+
+```go
+func CORSMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        origin := r.Header.Get("Origin")
+        
+        // Check against allowed origins
+        if isAllowedOrigin(origin) {
+            w.Header().Set("Access-Control-Allow-Origin", origin)
+            w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+            w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            w.Header().Set("Access-Control-Max-Age", "3600")
+            w.Header().Set("Access-Control-Allow-Credentials", "true")
+        }
+        
+        if r.Method == "OPTIONS" {
+            w.WriteHeader(http.StatusOK)
+            return
+        }
+        
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+### 7.5 SQL Injection Prevention
+
+```go
+// ALWAYS use parameterized queries
+// CORRECT:
+db.Query("SELECT * FROM links WHERE short_code = ?", shortCode)
+
+// NEVER concatenate user input:
+// WRONG: db.Query("SELECT * FROM links WHERE short_code = '" + shortCode + "'")
+
+// For dynamic column names, use allowlist validation:
+func buildOrderByClause(sort string) string {
+    allowed := map[string]string{
+        "created_desc": "created_at DESC",
+        "clicks_desc":  "click_count DESC",
+        "title_asc":    "title ASC",
+    }
+    
+    if clause, ok := allowed[sort]; ok {
+        return clause
+    }
+    return "created_at DESC" // default
+}
+```
+
+---
+
+## 8. DEPLOYMENT & OPERATIONS
+
+### 8.1 Initialization Script
+
+```bash
+#!/bin/bash
+# scripts/setup.sh
+
+set -e
+
+echo "=== Trackr Setup ==="
+
+# Create directories
+mkdir -p /var/lib/trackr/dbs
+mkdir -p /var/lib/trackr/geoip
+mkdir -p /var/log/trackr
+mkdir -p /etc/trackr/saml
+
+# Download GeoIP database
+echo "Downloading GeoIP database..."
+wget -O /var/lib/trackr/geoip/GeoLite2-City.mmdb.tar.gz \
+  "https://download.maxmind.com/app/geoip_download?license_key=${MAXMIND_LICENSE_KEY}&edition_id=GeoLite2-City&suffix=tar.gz"
+tar -xzf /var/lib/trackr/geoip/GeoLite2-City.mmdb.tar.gz -C /var/lib/trackr/geoip --strip-components=1
+
+# Generate SAML certificates
+echo "Generating SAML certificates..."
+openssl req -x509 -newkey rsa:2048 -keyout /etc/trackr/saml/sp-key.pem \
+  -out /etc/trackr/saml/sp-cert.pem -days 3650 -nodes \
+  -subj "/CN=trackr.io"
+
+# Run database migrations
+echo "Running global DB migrations..."
+./trackr migrate --target=global --direction=up
+
+echo "Setup complete!"
+```
+
+### 8.2 Migration Command
+
+```go
+// cmd/migrate/main.go
+package main
+
+import (
+    "flag"
+    "fmt"
+    "log"
+)
+
+func main() {
+    target := flag.String("target", "global", "Migration target: global or tenant")
+    direction := flag.String("direction", "up", "Migration direction: up or down")
+    orgID := flag.String("org", "", "Organization ID (required for tenant migrations)")
+    
+    flag.Parse()
+    
+    switch *target {
+    case "global":
+        if err := migrateGlobal(*direction); err != nil {
+            log.Fatal(err)
+        }
+    case "tenant":
+        if *orgID == "" {
+            log.Fatal("--org flag required for tenant migrations")
+        }
+        if err := migrateTenant(*orgID, *direction); err != nil {
+            log.Fatal(err)
+        }
+    default:
+        log.Fatal("Invalid target: must be 'global' or 'tenant'")
+    }
+    
+    fmt.Println("Migration completed successfully")
+}
+```
+
+### 8.3 Health Check Endpoint
+
+```go
+// GET /health
+type HealthResponse struct {
+    Status    string            `json:"status"`
+    Timestamp int64             `json:"timestamp"`
+    Checks    map[string]string `json:"checks"`
+}
+
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+    checks := make(map[string]string)
+    
+    // Check Global DB
+    if err := globalDB.Ping(); err != nil {
+        checks["global_db"] = "unhealthy: " + err.Error()
+    } else {
+        checks["global_db"] = "healthy"
+    }
+    
+    // Check GeoIP
+    if _, err := geoip.Lookup("8.8.8.8"); err != nil {
