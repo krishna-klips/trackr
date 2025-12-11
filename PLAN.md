@@ -2011,3 +2011,1015 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
     
     // Check GeoIP
     if _, err := geoip.Lookup("8.8.8.8"); err != nil {
+```go
+        checks["geoip"] = "unhealthy: " + err.Error()
+    } else {
+        checks["geoip"] = "healthy"
+    }
+    
+    // Check cache
+    checks["cache"] = "healthy"
+    
+    // Determine overall status
+    status := "healthy"
+    for _, check := range checks {
+        if strings.HasPrefix(check, "unhealthy") {
+            status = "degraded"
+            break
+        }
+    }
+    
+    response := HealthResponse{
+        Status:    status,
+        Timestamp: time.Now().Unix(),
+        Checks:    checks,
+    }
+    
+    statusCode := http.StatusOK
+    if status == "degraded" {
+        statusCode = http.StatusServiceUnavailable
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(statusCode)
+    json.NewEncoder(w).Encode(response)
+}
+```
+
+### 8.4 Backup Strategy
+
+```bash
+#!/bin/bash
+# scripts/backup.sh
+
+BACKUP_DIR="/var/backups/trackr"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Backup Global DB (Turso - handled by Turso's built-in backups)
+# But we export a snapshot for redundancy
+echo "Exporting global DB snapshot..."
+turso db shell trackr-global ".dump" > $BACKUP_DIR/global_${TIMESTAMP}.sql
+
+# Backup all tenant databases
+echo "Backing up tenant databases..."
+mkdir -p $BACKUP_DIR/tenants_${TIMESTAMP}
+cp /var/lib/trackr/dbs/*.db $BACKUP_DIR/tenants_${TIMESTAMP}/
+
+# Compress backups
+echo "Compressing..."
+tar -czf $BACKUP_DIR/full_backup_${TIMESTAMP}.tar.gz \
+  $BACKUP_DIR/global_${TIMESTAMP}.sql \
+  $BACKUP_DIR/tenants_${TIMESTAMP}
+
+# Cleanup old backups (keep last 30 days)
+find $BACKUP_DIR -name "full_backup_*.tar.gz" -mtime +30 -delete
+
+# Upload to S3 (optional)
+# aws s3 cp $BACKUP_DIR/full_backup_${TIMESTAMP}.tar.gz s3://trackr-backups/
+
+echo "Backup completed: full_backup_${TIMESTAMP}.tar.gz"
+```
+
+### 8.5 Monitoring Metrics
+
+```go
+// Expose Prometheus metrics
+import "github.com/prometheus/client_golang/prometheus"
+
+var (
+    redirectLatency = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "trackr_redirect_duration_seconds",
+            Help:    "Redirect latency distribution",
+            Buckets: prometheus.DefBuckets,
+        },
+        []string{"status"},
+    )
+    
+    redirectTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "trackr_redirects_total",
+            Help: "Total number of redirects",
+        },
+        []string{"org_id", "status"},
+    )
+    
+    clicksLogged = prometheus.NewCounter(
+        prometheus.CounterOpts{
+            Name: "trackr_clicks_logged_total",
+            Help: "Total clicks successfully logged",
+        },
+    )
+    
+    cacheHitRate = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "trackr_cache_hit_rate",
+            Help: "Cache hit rate percentage",
+        },
+        []string{"cache_type"},
+    )
+    
+    activeOrganizations = prometheus.NewGauge(
+        prometheus.GaugeOpts{
+            Name: "trackr_active_organizations",
+            Help: "Number of active organizations",
+        },
+    )
+)
+
+func init() {
+    prometheus.MustRegister(
+        redirectLatency,
+        redirectTotal,
+        clicksLogged,
+        cacheHitRate,
+        activeOrganizations,
+    )
+}
+
+// Instrument redirect handler
+func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    start := time.Now()
+    
+    // ... redirect logic ...
+    
+    duration := time.Since(start).Seconds()
+    redirectLatency.WithLabelValues("success").Observe(duration)
+    redirectTotal.WithLabelValues(orgID, "success").Inc()
+}
+```
+
+---
+
+## 9. ERROR HANDLING
+
+### 9.1 Standard Error Responses
+
+```go
+type ErrorResponse struct {
+    Error   string      `json:"error"`
+    Message string      `json:"message"`
+    Code    string      `json:"code"`
+    Details interface{} `json:"details,omitempty"`
+}
+
+// Error codes
+const (
+    ErrCodeInvalidInput      = "INVALID_INPUT"
+    ErrCodeUnauthorized      = "UNAUTHORIZED"
+    ErrCodeForbidden         = "FORBIDDEN"
+    ErrCodeNotFound          = "NOT_FOUND"
+    ErrCodeConflict          = "CONFLICT"
+    ErrCodeQuotaExceeded     = "QUOTA_EXCEEDED"
+    ErrCodeRateLimitExceeded = "RATE_LIMIT_EXCEEDED"
+    ErrCodeInternal          = "INTERNAL_ERROR"
+)
+
+func WriteError(w http.ResponseWriter, status int, code, message string, details interface{}) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    
+    json.NewEncoder(w).Encode(ErrorResponse{
+        Error:   http.StatusText(status),
+        Message: message,
+        Code:    code,
+        Details: details,
+    })
+}
+
+// Usage examples
+func (h *LinkHandler) Create(w http.ResponseWriter, r *http.Request) {
+    var req CreateLinkRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        WriteError(w, http.StatusBadRequest, ErrCodeInvalidInput, 
+            "Invalid request body", nil)
+        return
+    }
+    
+    // Check quota
+    if linkCount >= org.LinkQuota {
+        WriteError(w, http.StatusForbidden, ErrCodeQuotaExceeded,
+            "Link quota exceeded", map[string]interface{}{
+                "current": linkCount,
+                "limit":   org.LinkQuota,
+            })
+        return
+    }
+    
+    // ... rest of handler
+}
+```
+
+### 9.2 Validation Errors
+
+```go
+type ValidationError struct {
+    Field   string `json:"field"`
+    Message string `json:"message"`
+}
+
+func ValidateCreateLinkRequest(req *CreateLinkRequest) []ValidationError {
+    var errors []ValidationError
+    
+    // Validate destination URL
+    if req.DestinationURL == "" {
+        errors = append(errors, ValidationError{
+            Field:   "destination_url",
+            Message: "Destination URL is required",
+        })
+    } else if !isValidURL(req.DestinationURL) {
+        errors = append(errors, ValidationError{
+            Field:   "destination_url",
+            Message: "Invalid URL format",
+        })
+    }
+    
+    // Validate short code
+    if req.ShortCode != "" && !isValidShortCode(req.ShortCode) {
+        errors = append(errors, ValidationError{
+            Field:   "short_code",
+            Message: "Short code must be 3-12 alphanumeric characters",
+        })
+    }
+    
+    // Validate redirect type
+    validTypes := []string{"temporary", "permanent"}
+    if req.RedirectType != "" && !contains(validTypes, req.RedirectType) {
+        errors = append(errors, ValidationError{
+            Field:   "redirect_type",
+            Message: "Must be 'temporary' or 'permanent'",
+        })
+    }
+    
+    return errors
+}
+
+// In handler
+func (h *LinkHandler) Create(w http.ResponseWriter, r *http.Request) {
+    var req CreateLinkRequest
+    json.NewDecoder(r.Body).Decode(&req)
+    
+    if validationErrors := ValidateCreateLinkRequest(&req); len(validationErrors) > 0 {
+        WriteError(w, http.StatusBadRequest, ErrCodeInvalidInput,
+            "Validation failed", validationErrors)
+        return
+    }
+    
+    // ... proceed with creation
+}
+```
+
+---
+
+## 10. TESTING STRATEGY
+
+### 10.1 Unit Tests Structure
+
+```
+internal/
+├── engine/
+│   ├── links/
+│   │   ├── service.go
+│   │   ├── service_test.go
+│   │   ├── shortcode_test.go
+│   │   └── validator_test.go
+│   └── redirect/
+│       ├── handler_test.go
+│       ├── cache_test.go
+│       └── rules_test.go
+└── platform/
+    └── auth/
+        ├── jwt_test.go
+        └── rbac_test.go
+```
+
+### 10.2 Critical Test Cases
+
+```go
+// internal/engine/redirect/rules_test.go
+package redirect
+
+import "testing"
+
+func TestGeoRuleEvaluation(t *testing.T) {
+    tests := []struct {
+        name        string
+        rules       *RedirectRules
+        countryCode string
+        expected    string
+    }{
+        {
+            name: "US visitor gets US URL",
+            rules: &RedirectRules{
+                Geo: map[string]string{
+                    "US": "https://us.example.com",
+                    "GB": "https://uk.example.com",
+                },
+            },
+            countryCode: "US",
+            expected:    "https://us.example.com",
+        },
+        {
+            name: "Unknown country gets default",
+            rules: &RedirectRules{
+                Geo: map[string]string{
+                    "US": "https://us.example.com",
+                },
+            },
+            countryCode: "FR",
+            expected:    "",
+        },
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            ctx := &RequestContext{CountryCode: tt.countryCode}
+            result := tt.rules.Evaluate(ctx)
+            
+            if result != tt.expected {
+                t.Errorf("Expected %s, got %s", tt.expected, result)
+            }
+        })
+    }
+}
+
+func TestDeviceRulePriority(t *testing.T) {
+    rules := &RedirectRules{
+        Device: map[string]string{
+            "ios": "https://apps.apple.com/app",
+        },
+        Geo: map[string]string{
+            "US": "https://us.example.com",
+        },
+    }
+    
+    ctx := &RequestContext{
+        DeviceType:  "mobile",
+        OS:          "iOS",
+        CountryCode: "US",
+    }
+    
+    // Device rules should take priority
+    result := rules.Evaluate(ctx)
+    expected := "https://apps.apple.com/app"
+    
+    if result != expected {
+        t.Errorf("Device rule should take priority. Expected %s, got %s", expected, result)
+    }
+}
+```
+
+### 10.3 Integration Test Example
+
+```go
+// internal/api/handlers/link_handler_integration_test.go
+package handlers
+
+import (
+    "bytes"
+    "encoding/json"
+    "net/http/httptest"
+    "testing"
+)
+
+func TestLinkCreationFlow(t *testing.T) {
+    // Setup test database
+    db := setupTestDB(t)
+    defer db.Close()
+    
+    // Create test organization and user
+    org := createTestOrg(t, db)
+    user := createTestUser(t, db, org.ID)
+    token := generateTestJWT(user)
+    
+    // Test link creation
+    reqBody := map[string]interface{}{
+        "destination_url": "https://example.com/test",
+        "title":           "Test Link",
+        "short_code":      "test123",
+    }
+    body, _ := json.Marshal(reqBody)
+    
+    req := httptest.NewRequest("POST", "/api/v1/links", bytes.NewBuffer(body))
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("Content-Type", "application/json")
+    
+    w := httptest.NewRecorder()
+    router.ServeHTTP(w, req)
+    
+    // Assert response
+    if w.Code != 201 {
+        t.Errorf("Expected status 201, got %d", w.Code)
+    }
+    
+    var response CreateLinkResponse
+    json.NewDecoder(w.Body).Decode(&response)
+    
+    if response.ShortCode != "test123" {
+        t.Errorf("Expected short_code 'test123', got '%s'", response.ShortCode)
+    }
+    
+    // Test redirect functionality
+    redirectReq := httptest.NewRequest("GET", "/test123", nil)
+    redirectW := httptest.NewRecorder()
+    router.ServeHTTP(redirectW, redirectReq)
+    
+    if redirectW.Code != 302 {
+        t.Errorf("Expected redirect 302, got %d", redirectW.Code)
+    }
+    
+    location := redirectW.Header().Get("Location")
+    if location != "https://example.com/test" {
+        t.Errorf("Expected redirect to 'https://example.com/test', got '%s'", location)
+    }
+}
+```
+
+### 10.4 Performance Benchmarks
+
+```go
+// internal/engine/redirect/benchmark_test.go
+package redirect
+
+import "testing"
+
+func BenchmarkRedirectHandler(b *testing.B) {
+    handler := setupBenchHandler()
+    
+    b.ResetTimer()
+    b.RunParallel(func(pb *testing.PB) {
+        for pb.Next() {
+            req := httptest.NewRequest("GET", "/abc123", nil)
+            w := httptest.NewRecorder()
+            handler.ServeHTTP(w, req)
+        }
+    })
+}
+
+func BenchmarkCacheLookup(b *testing.B) {
+    cache := NewLinkCache()
+    cache.Set("test", &CachedLink{
+        DestinationURL: "https://example.com",
+    })
+    
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        cache.Get("test")
+    }
+}
+
+// Target: <50ms P95 latency for redirects
+// Target: <1ms for cache lookups
+```
+
+---
+
+## 11. API REQUEST/RESPONSE EXAMPLES
+
+### 11.1 Complete Link Creation Flow
+
+```http
+### Create Link
+POST https://api.trackr.io/v1/links
+Authorization: Bearer eyJhbGc...
+Content-Type: application/json
+
+{
+  "destination_url": "https://example.com/product",
+  "title": "Product Launch Page",
+  "short_code": "launch24",
+  "redirect_type": "temporary",
+  "rules": {
+    "geo": {
+      "US": "https://us.example.com/product",
+      "GB": "https://uk.example.com/product",
+      "default": "https://global.example.com/product"
+    },
+    "device": {
+      "ios": "https://apps.apple.com/app/product",
+      "android": "https://play.google.com/store/apps/product"
+    }
+  },
+  "default_utm_params": {
+    "utm_source": "twitter",
+    "utm_medium": "social",
+    "utm_campaign": "launch2024"
+  },
+  "expires_at": 1735689600
+}
+
+### Response
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "id": "lnk_01HQXY2Z8K9NVMW7X6BQTA45BC",
+  "short_code": "launch24",
+  "short_url": "https://trk.io/launch24",
+  "destination_url": "https://example.com/product",
+  "title": "Product Launch Page",
+  "redirect_type": "temporary",
+  "status": "active",
+  "created_by": "usr_01HQXY1A2B3C4D5E6F7G8H9I0J",
+  "click_count": 0,
+  "qr_code_url": "https://api.trackr.io/v1/links/lnk_01HQXY.../qr",
+  "created_at": 1702425600,
+  "updated_at": 1702425600
+}
+```
+
+### 11.2 Analytics Query Example
+
+```http
+### Get Link Analytics
+GET https://api.trackr.io/v1/links/lnk_01HQXY.../analytics?start_date=2024-01-01&end_date=2024-01-31&group_by=day
+Authorization: Bearer eyJhbGc...
+
+### Response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "link_id": "lnk_01HQXY2Z8K9NVMW7X6BQTA45BC",
+  "period": {
+    "start": "2024-01-01",
+    "end": "2024-01-31"
+  },
+  "summary": {
+    "total_clicks": 15420,
+    "unique_ips": 8932,
+    "unique_devices": 7654,
+    "avg_clicks_per_day": 497,
+    "peak_day": {
+      "date": "2024-01-15",
+      "clicks": 1247
+    }
+  },
+  "timeseries": [
+    {
+      "date": "2024-01-01",
+      "clicks": 512,
+      "unique_ips": 287
+    },
+    {
+      "date": "2024-01-02",
+      "clicks": 489,
+      "unique_ips": 301
+    }
+  ],
+  "geography": {
+    "countries": [
+      {
+        "code": "US",
+        "name": "United States",
+        "clicks": 7821,
+        "percentage": 50.7
+      },
+      {
+        "code": "GB",
+        "name": "United Kingdom",
+        "clicks": 2314,
+        "percentage": 15.0
+      }
+    ],
+    "cities": [
+      {
+        "name": "New York",
+        "country": "US",
+        "clicks": 2145
+      }
+    ]
+  },
+  "referrers": [
+    {
+      "domain": "twitter.com",
+      "clicks": 4521,
+      "percentage": 29.3
+    },
+    {
+      "domain": "facebook.com",
+      "clicks": 2876,
+      "percentage": 18.7
+    },
+    {
+      "domain": "direct",
+      "clicks": 3421,
+      "percentage": 22.2
+    }
+  ],
+  "devices": {
+    "types": {
+      "mobile": 9234,
+      "desktop": 5127,
+      "tablet": 1059
+    },
+    "operating_systems": {
+      "iOS": 5421,
+      "Android": 3813,
+      "Windows": 3127,
+      "macOS": 2198,
+      "Linux": 861
+    },
+    "browsers": {
+      "Chrome": 8234,
+      "Safari": 4521,
+      "Firefox": 2665
+    }
+  },
+  "utm_parameters": {
+    "sources": [
+      {"value": "twitter", "clicks": 5234},
+      {"value": "facebook", "clicks": 3421}
+    ],
+    "campaigns": [
+      {"value": "launch2024", "clicks": 8932}
+    ]
+  }
+}
+```
+
+### 11.3 Invite User Flow
+
+```http
+### Create Invite
+POST https://api.trackr.io/v1/invites
+Authorization: Bearer eyJhbGc...
+Content-Type: application/json
+
+{
+  "email": "newuser@acme.com",
+  "role": "member",
+  "max_uses": 1,
+  "expires_in_hours": 168
+}
+
+### Response
+HTTP/1.1 201 Created
+
+{
+  "id": "inv_01HQXZ3A4B5C6D7E8F9G0H1I2J",
+  "code": "TRK-ABC123-XYZ789",
+  "email": "newuser@acme.com",
+  "role": "member",
+  "invite_url": "https://app.trackr.io/signup?code=TRK-ABC123-XYZ789",
+  "status": "pending",
+  "max_uses": 1,
+  "current_uses": 0,
+  "expires_at": 1703033600,
+  "created_at": 1702428800
+}
+
+### User Signs Up
+POST https://api.trackr.io/v1/auth/signup
+Content-Type: application/json
+
+{
+  "invite_code": "TRK-ABC123-XYZ789",
+  "email": "newuser@acme.com",
+  "password": "SecurePass123!",
+  "full_name": "New User"
+}
+
+### Response
+HTTP/1.1 201 Created
+
+{
+  "user": {
+    "id": "usr_01HQXZ4K5L6M7N8O9P0Q1R2S3T",
+    "email": "newuser@acme.com",
+    "full_name": "New User",
+    "role": "member",
+    "organization": {
+      "id": "org_01HQXY...",
+      "name": "Acme Corp",
+      "slug": "acme-corp"
+    }
+  },
+  "access_token": "eyJhbGc...",
+  "refresh_token": "eyJhbGc...",
+  "expires_in": 900
+}
+```
+
+---
+
+## 12. WORKER PROCESSES
+
+### 12.1 Stats Aggregation Worker
+
+```go
+// cmd/worker/main.go
+package main
+
+import (
+    "time"
+    "log"
+)
+
+func main() {
+    // Start daily stats aggregator
+    go runDailyStatsWorker()
+    
+    // Start webhook retry worker
+    go runWebhookRetryWorker()
+    
+    // Start link expiry worker
+    go runLinkExpiryWorker()
+    
+    // Keep process alive
+    select {}
+}
+
+func runDailyStatsWorker() {
+    // Run at 01:00 UTC daily
+    for {
+        now := time.Now().UTC()
+        next := time.Date(now.Year(), now.Month(), now.Day()+1, 1, 0, 0, 0, time.UTC)
+        duration := next.Sub(now)
+        
+        log.Printf("Daily stats worker sleeping for %v", duration)
+        time.Sleep(duration)
+        
+        log.Println("Running daily stats aggregation...")
+        if err := aggregateDailyStats(); err != nil {
+            log.Printf("Error aggregating stats: %v", err)
+        }
+    }
+}
+
+func aggregateDailyStats() error {
+    yesterday := time.Now().Add(-24 * time.Hour).Format("2006-01-02")
+    
+    orgs, err := orgRepo.GetAll()
+    if err != nil {
+        return err
+    }
+    
+    for _, org := range orgs {
+        tenantDB, err := openTenantDB(org.DBFilePath)
+        if err != nil {
+            log.Printf("Failed to open tenant DB for org %s: %v", org.ID, err)
+            continue
+        }
+        
+        links, _ := linkRepo.GetAll(tenantDB)
+        for _, link := range links {
+            stats := computeDailyStats(tenantDB, link.ID, yesterday)
+            
+            if err := dailyStatsRepo.Upsert(tenantDB, stats); err != nil {
+                log.Printf("Failed to save stats for link %s: %v", link.ID, err)
+            }
+        }
+        
+        tenantDB.Close()
+    }
+    
+    log.Printf("Completed daily stats aggregation for %s", yesterday)
+    return nil
+}
+```
+
+### 12.2 Webhook Retry Worker
+
+```go
+func runWebhookRetryWorker() {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        retryFailedWebhooks()
+    }
+}
+
+func retryFailedWebhooks() {
+    // Find webhooks that failed in the last hour
+    failedWebhooks := webhookRepo.GetFailed(time.Now().Add(-1 * time.Hour).Unix())
+    
+    for _, webhook := range failedWebhooks {
+        if webhook.RetryCount >= 3 {
+            // Max retries reached, pause webhook
+            webhookRepo.UpdateStatus(webhook.ID, "paused")
+            log.Printf("Webhook %s paused after max retries", webhook.ID)
+            continue
+        }
+        
+        // Exponential backoff
+        backoffDuration := time.Duration(math.Pow(2, float64(webhook.RetryCount))) * time.Minute
+        if time.Since(time.Unix(webhook.LastTriggeredAt, 0)) < backoffDuration {
+            continue
+        }
+        
+        // Retry delivery
+        if err := webhookDispatcher.DeliverSync(webhook); err != nil {
+            webhookRepo.IncrementRetryCount(webhook.ID)
+            webhookRepo.UpdateLastError(webhook.ID, err.Error())
+        } else {
+            webhookRepo.UpdateStatus(webhook.ID, "active")
+            webhookRepo.ResetRetryCount(webhook.ID)
+        }
+    }
+}
+```
+
+### 12.3 Link Expiry Worker
+
+```go
+func runLinkExpiryWorker() {
+    ticker := time.NewTicker(1 * time.Hour)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        expireLinks()
+    }
+}
+
+func expireLinks() {
+    now := time.Now().Unix()
+    
+    orgs, _ := orgRepo.GetAll()
+    for _, org := range orgs {
+        tenantDB, _ := openTenantDB(org.DBFilePath)
+        
+        // Find links that have passed their expiry date
+        expiredLinks, _ := linkRepo.GetExpired(tenantDB, now)
+        
+        for _, link := range expiredLinks {
+            // Archive the link
+            linkRepo.UpdateStatus(tenantDB, link.ID, "archived")
+            log.Printf("Archived expired link: %s", link.ShortCode)
+            
+            // Trigger webhook
+            webhookDispatcher.Dispatch("link.expired", map[string]interface{}{
+                "link_id":    link.ID,
+                "short_code": link.ShortCode,
+                "expired_at": link.ExpiresAt,
+            })
+        }
+        
+        tenantDB.Close()
+    }
+}
+```
+
+---
+
+## 13. CRITICAL PERFORMANCE OPTIMIZATIONS
+
+### 13.1 SQLite Optimizations
+
+```go
+func openTenantDB(path string) (*sql.DB, error) {
+    // Optimal pragmas for read-heavy workload
+    dsn := path + "?" +
+        "cache=shared&" +
+        "mode=rwc&" +
+        "_journal_mode=WAL&" +
+        "_synchronous=NORMAL&" +
+        "_cache_size=-64000&" + // 64MB cache
+        "_temp_store=MEMORY&" +
+        "_mmap_size=268435456" // 256MB mmap
+    
+    db, err := sql.Open("sqlite3", dsn)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Connection pool settings
+    db.SetMaxOpenConns(25)
+    db.SetMaxIdleConns(10)
+    db.SetConnMaxLifetime(time.Hour)
+    
+    // Execute pragmas
+    _, err = db.Exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA cache_size = -64000;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA mmap_size = 268435456;
+        PRAGMA page_size = 4096;
+    `)
+    
+    return db, err
+}
+```
+
+### 13.2 Prepared Statements
+
+```go
+type LinkRepository struct {
+    db                *sql.DB
+    getByShortStmt    *sql.Stmt
+    insertClickStmt   *sql.Stmt
+    incrementClickStmt *sql.Stmt
+}
+
+func NewLinkRepository(db *sql.DB) (*LinkRepository, error) {
+    repo := &LinkRepository{db: db}
+    
+    var err error
+    
+    // Pre-compile frequently used queries
+    repo.getByShortStmt, err = db.Prepare(`
+        SELECT id, short_code, destination_url, rules, redirect_type, status, password_hash
+        FROM links 
+        WHERE short_code = ? AND status = 'active'
+    `)
+    if err != nil {
+        return nil, err
+    }
+    
+    repo.insertClickStmt, err = db.Prepare(`
+        INSERT INTO clicks (
+            id, link_id, short_code, timestamp, ip_address, user_agent,
+            country_code, city, device_type, os, browser, referrer,
+            referrer_domain, utm_source, utm_medium, utm_campaign, destination_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    if err != nil {
+        return nil, err
+    }
+    
+    repo.incrementClickStmt, err = db.Prepare(`
+        UPDATE links 
+        SET click_count = click_count + 1, last_click_at = ?
+        WHERE id = ?
+    `)
+    if err != nil {
+        return nil, err
+    }
+    
+    return repo, nil
+}
+```
+
+### 13.3 Batch Inserts for Click Logging
+
+```go
+type ClickBuffer struct {
+    clicks []Click
+    mu     sync.Mutex
+    size   int
+}
+
+func (b *ClickBuffer) Add(click Click) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    b.clicks = append(b.clicks, click)
+    
+    // Flush when buffer is full
+    if len(b.clicks) >= b.size {
+        go b.Flush()
+    }
+}
+
+func (b *ClickBuffer) Flush() {
+    b.mu.Lock()
+    clicks := b.clicks
+    b.clicks = nil
+    b.mu.Unlock()
+    
+    if len(clicks) == 0 {
+        return
+    }
+    
+    // Batch insert
+    tx, _ := db.Begin()
+    stmt, _ := tx.Prepare(`
+        INSERT INTO clicks (...) VALUES (?, ?, ...)
+    `)
+    
+    for _, click := range clicks {
+        stmt.Exec(click.ID, click.LinkID, /* ... */)
+    }
+    
+    stmt.Close()
+    tx.Commit()
+}
+
+// Periodic flush every 5 seconds
+func (b *ClickBuffer) StartPeriodicFlush() {
+    ticker := time.NewTicker(5 * time.Second)
+    go func() {
+        for range ticker.C {
+            b.Flush()
+        }
+    }()
+}
+```
+
+---
+
+## 14. SAML IMPLEMENTATION DETAILS
+
+### 14.1 SAML Configuration
+
+```go
+import (
+    "github.com/crewjam/saml"
+    "github.com/crewjam/saml/samlsp"
+)
+
+func initSAMLMiddleware(org *Organization, samlConfig *SAMLConfig) (*samlsp.Middleware, error) {
+    keyPair, err := tls.LoadX509KeyPair(
+        config.
