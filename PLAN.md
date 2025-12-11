@@ -3023,3 +3023,745 @@ import (
 func initSAMLMiddleware(org *Organization, samlConfig *SAMLConfig) (*samlsp.Middleware, error) {
     keyPair, err := tls.LoadX509KeyPair(
         config.
+```go
+        config.SAML.CertPath,
+        config.SAML.KeyPath,
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
+    if err != nil {
+        return nil, err
+    }
+    
+    idpMetadataURL, _ := url.Parse(samlConfig.MetadataURL)
+    idpMetadata, err := samlsp.FetchMetadata(
+        context.Background(),
+        http.DefaultClient,
+        *idpMetadataURL,
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    rootURL, _ := url.Parse(fmt.Sprintf("https://%s", config.Domains.AppDomain))
+    
+    samlSP, err := samlsp.New(samlsp.Options{
+        URL:            *rootURL,
+        Key:            keyPair.PrivateKey.(*rsa.PrivateKey),
+        Certificate:    keyPair.Leaf,
+        IDPMetadata:    idpMetadata,
+        EntityID:       samlConfig.EntityID,
+        SignRequest:    true,
+        UseArtifactResponse: false,
+        CookieName:     fmt.Sprintf("saml_%s", org.Slug),
+        CookieSecure:   true,
+        CookieSameSite: http.SameSiteNoneMode,
+    })
+    
+    return samlSP, err
+}
+```
+
+### 14.2 SAML Assertion Processing
+
+```go
+func (h *AuthHandler) HandleSAMLCallback(w http.ResponseWriter, r *http.Request) {
+    // Parse SAML response
+    assertion := samlsp.AssertionFromContext(r.Context())
+    if assertion == nil {
+        http.Error(w, "Invalid SAML assertion", http.StatusBadRequest)
+        return
+    }
+    
+    // Extract user attributes
+    email := extractAttribute(assertion, "email")
+    if email == "" {
+        email = assertion.Subject.NameID.Value
+    }
+    
+    fullName := extractAttribute(assertion, "name")
+    if fullName == "" {
+        firstName := extractAttribute(assertion, "firstName")
+        lastName := extractAttribute(assertion, "lastName")
+        fullName = strings.TrimSpace(firstName + " " + lastName)
+    }
+    
+    // Extract organization from email domain or RelayState
+    domain := strings.Split(email, "@")[1]
+    org, err := orgRepo.GetByDomain(domain)
+    if err != nil {
+        http.Error(w, "Organization not found", http.StatusNotFound)
+        return
+    }
+    
+    // Verify SAML is enabled for this org
+    if !org.SAMLEnabled {
+        http.Error(w, "SAML not enabled for organization", http.StatusForbidden)
+        return
+    }
+    
+    // Get or create user
+    user, err := userRepo.GetByEmail(email)
+    if err != nil {
+        // Create new user via SAML
+        user = &User{
+            ID:             generateUUID(),
+            OrganizationID: org.ID,
+            Email:          email,
+            EmailVerified:  true, // Trust IdP verification
+            FullName:       fullName,
+            Role:           "member",
+            PasswordHash:   "", // SAML-only user
+            CreatedAt:      time.Now().Unix(),
+            UpdatedAt:      time.Now().Unix(),
+        }
+        
+        if err := userRepo.Create(user); err != nil {
+            http.Error(w, "Failed to create user", http.StatusInternalServerError)
+            return
+        }
+    }
+    
+    // Update last login
+    userRepo.UpdateLastLogin(user.ID, time.Now().Unix())
+    
+    // Generate JWT tokens
+    accessToken, err := generateAccessToken(user, org)
+    refreshToken, err := generateRefreshToken(user)
+    
+    // Set secure cookies
+    http.SetCookie(w, &http.Cookie{
+        Name:     "access_token",
+        Value:    accessToken,
+        Path:     "/",
+        MaxAge:   900, // 15 minutes
+        Secure:   true,
+        HttpOnly: true,
+        SameSite: http.SameSiteStrictMode,
+    })
+    
+    http.SetCookie(w, &http.Cookie{
+        Name:     "refresh_token",
+        Value:    refreshToken,
+        Path:     "/",
+        MaxAge:   2592000, // 30 days
+        Secure:   true,
+        HttpOnly: true,
+        SameSite: http.SameSiteStrictMode,
+    })
+    
+    // Redirect to dashboard
+    http.Redirect(w, r, "https://app.trackr.io/dashboard", http.StatusFound)
+}
+
+func extractAttribute(assertion *saml.Assertion, name string) string {
+    for _, stmt := range assertion.AttributeStatements {
+        for _, attr := range stmt.Attributes {
+            if attr.Name == name || attr.FriendlyName == name {
+                if len(attr.Values) > 0 {
+                    return attr.Values[0].Value
+                }
+            }
+        }
+    }
+    return ""
+}
+```
+
+### 14.3 SAML Metadata Endpoint
+
+```go
+func (h *AuthHandler) GetSAMLMetadata(w http.ResponseWriter, r *http.Request) {
+    orgSlug := chi.URLParam(r, "org_slug")
+    
+    org, err := orgRepo.GetBySlug(orgSlug)
+    if err != nil {
+        http.NotFound(w, r)
+        return
+    }
+    
+    samlConfig, err := samlConfigRepo.GetByOrgID(org.ID)
+    if err != nil {
+        http.Error(w, "SAML not configured", http.StatusNotFound)
+        return
+    }
+    
+    middleware, err := initSAMLMiddleware(org, samlConfig)
+    if err != nil {
+        http.Error(w, "SAML configuration error", http.StatusInternalServerError)
+        return
+    }
+    
+    // Generate SP metadata XML
+    metadata := middleware.ServiceProvider.Metadata()
+    metadataXML, err := xml.MarshalIndent(metadata, "", "  ")
+    if err != nil {
+        http.Error(w, "Failed to generate metadata", http.StatusInternalServerError)
+        return
+    }
+    
+    w.Header().Set("Content-Type", "application/samlmetadata+xml")
+    w.Write([]byte(xml.Header))
+    w.Write(metadataXML)
+}
+```
+
+---
+
+## 15. ENVIRONMENT VARIABLES
+
+```bash
+# .env.example
+
+# Server Configuration
+SERVER_HOST=0.0.0.0
+SERVER_PORT=8080
+
+# Database
+TURSO_DB_URL=libsql://trackr-global.turso.io
+TURSO_AUTH_TOKEN=your_turso_auth_token_here
+TENANT_DB_PATH=/var/lib/trackr/dbs
+
+# JWT
+JWT_SECRET=your_jwt_secret_minimum_32_characters_here
+JWT_ACCESS_TTL=15m
+JWT_REFRESH_TTL=720h
+
+# Domains
+SHORT_DOMAIN=trk.io
+APP_DOMAIN=app.trackr.io
+API_DOMAIN=api.trackr.io
+
+# GeoIP
+GEOIP_DB_PATH=/var/lib/trackr/geoip/GeoLite2-City.mmdb
+MAXMIND_LICENSE_KEY=your_maxmind_license_key
+
+# Email (SMTP)
+SMTP_HOST=smtp.sendgrid.net
+SMTP_PORT=587
+SMTP_USERNAME=apikey
+SMTP_PASSWORD=your_sendgrid_api_key
+EMAIL_FROM=noreply@trackr.io
+EMAIL_FROM_NAME=Trackr
+
+# SAML
+SAML_CERT_PATH=/etc/trackr/saml/sp-cert.pem
+SAML_KEY_PATH=/etc/trackr/saml/sp-key.pem
+SAML_ENTITY_ID=https://trackr.io/saml/metadata
+
+# Cache
+CACHE_LINK_TTL=5m
+CACHE_MAX_ENTRIES=100000
+
+# Rate Limiting
+RATE_LIMIT_REDIRECT=10000
+RATE_LIMIT_API_READ=1000
+RATE_LIMIT_API_WRITE=100
+
+# Logging
+LOG_LEVEL=info
+LOG_FORMAT=json
+
+# Feature Flags
+ENABLE_WEBHOOKS=true
+ENABLE_SAML=true
+ENABLE_AUDIT_LOGS=true
+
+# Monitoring
+ENABLE_METRICS=true
+METRICS_PORT=9090
+
+# Development
+DEBUG_MODE=false
+```
+
+---
+
+## 16. ROUTER CONFIGURATION
+
+```go
+// internal/api/router.go
+package api
+
+import (
+    "github.com/julienschmidt/httprouter"
+    "net/http"
+)
+
+func NewRouter(deps *Dependencies) *httprouter.Router {
+    router := httprouter.New()
+    
+    // Health & Metrics
+    router.GET("/health", wrap(deps.HealthHandler.Check))
+    router.GET("/metrics", wrap(deps.MetricsHandler.Export))
+    
+    // Public redirect endpoint (no auth)
+    router.GET("/:short_code", wrap(deps.RedirectHandler.Handle))
+    
+    // Authentication routes
+    router.POST("/api/v1/auth/signup", wrap(deps.AuthHandler.Signup))
+    router.POST("/api/v1/auth/login", wrap(deps.AuthHandler.Login))
+    router.POST("/api/v1/auth/refresh", wrap(deps.AuthHandler.Refresh))
+    router.POST("/api/v1/auth/logout", wrap(deps.AuthHandler.Logout))
+    
+    // SAML routes
+    router.GET("/api/v1/auth/saml/login", wrap(deps.AuthHandler.SAMLLogin))
+    router.POST("/api/v1/auth/saml/acs", wrap(deps.AuthHandler.HandleSAMLCallback))
+    router.GET("/api/v1/auth/saml/metadata/:org_slug", wrap(deps.AuthHandler.GetSAMLMetadata))
+    
+    // Protected routes - require authentication
+    auth := deps.AuthMiddleware
+    tenant := deps.TenantMiddleware
+    
+    // Organization management
+    router.GET("/api/v1/organizations/current", 
+        chain(deps.OrgHandler.GetCurrent, auth, tenant))
+    router.PATCH("/api/v1/organizations/current",
+        chain(deps.OrgHandler.Update, auth, tenant, requireRole("admin", "owner")))
+    
+    // Domain verification
+    router.POST("/api/v1/organizations/domains",
+        chain(deps.OrgHandler.AddDomain, auth, tenant, requireRole("admin", "owner")))
+    router.POST("/api/v1/organizations/domains/:domain_id/verify",
+        chain(deps.OrgHandler.VerifyDomain, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/organizations/domains",
+        chain(deps.OrgHandler.ListDomains, auth, tenant))
+    
+    // Invite management
+    router.POST("/api/v1/invites",
+        chain(deps.InviteHandler.Create, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/invites",
+        chain(deps.InviteHandler.List, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/invites/:invite_id",
+        chain(deps.InviteHandler.Get, auth, tenant, requireRole("admin", "owner")))
+    router.DELETE("/api/v1/invites/:invite_id",
+        chain(deps.InviteHandler.Revoke, auth, tenant, requireRole("admin", "owner")))
+    
+    // User management
+    router.GET("/api/v1/users",
+        chain(deps.UserHandler.List, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/users/:user_id",
+        chain(deps.UserHandler.Get, auth, tenant))
+    router.PATCH("/api/v1/users/:user_id/role",
+        chain(deps.UserHandler.UpdateRole, auth, tenant, requireRole("owner")))
+    router.DELETE("/api/v1/users/:user_id",
+        chain(deps.UserHandler.Delete, auth, tenant, requireRole("owner")))
+    
+    // Link management
+    router.POST("/api/v1/links",
+        chain(deps.LinkHandler.Create, auth, tenant, rateLimit("api_write")))
+    router.GET("/api/v1/links",
+        chain(deps.LinkHandler.List, auth, tenant, rateLimit("api_read")))
+    router.GET("/api/v1/links/:link_id",
+        chain(deps.LinkHandler.Get, auth, tenant, rateLimit("api_read")))
+    router.PATCH("/api/v1/links/:link_id",
+        chain(deps.LinkHandler.Update, auth, tenant, rateLimit("api_write")))
+    router.DELETE("/api/v1/links/:link_id",
+        chain(deps.LinkHandler.Delete, auth, tenant, rateLimit("api_write")))
+    router.GET("/api/v1/links/:link_id/qr",
+        chain(deps.LinkHandler.GetQRCode, auth, tenant))
+    
+    // Analytics
+    router.GET("/api/v1/links/:link_id/analytics",
+        chain(deps.AnalyticsHandler.GetLinkAnalytics, auth, tenant, rateLimit("analytics")))
+    router.GET("/api/v1/links/:link_id/clicks",
+        chain(deps.AnalyticsHandler.GetLinkClicks, auth, tenant, rateLimit("analytics")))
+    router.GET("/api/v1/analytics/overview",
+        chain(deps.AnalyticsHandler.GetOverview, auth, tenant, rateLimit("analytics")))
+    
+    // Webhooks
+    router.POST("/api/v1/webhooks",
+        chain(deps.WebhookHandler.Create, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/webhooks",
+        chain(deps.WebhookHandler.List, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/webhooks/:webhook_id",
+        chain(deps.WebhookHandler.Get, auth, tenant, requireRole("admin", "owner")))
+    router.PATCH("/api/v1/webhooks/:webhook_id",
+        chain(deps.WebhookHandler.Update, auth, tenant, requireRole("admin", "owner")))
+    router.DELETE("/api/v1/webhooks/:webhook_id",
+        chain(deps.WebhookHandler.Delete, auth, tenant, requireRole("admin", "owner")))
+    
+    // API Keys
+    router.POST("/api/v1/api-keys",
+        chain(deps.APIKeyHandler.Create, auth, tenant, requireRole("admin", "owner")))
+    router.GET("/api/v1/api-keys",
+        chain(deps.APIKeyHandler.List, auth, tenant, requireRole("admin", "owner")))
+    router.DELETE("/api/v1/api-keys/:key_id",
+        chain(deps.APIKeyHandler.Revoke, auth, tenant, requireRole("admin", "owner")))
+    
+    // Audit logs
+    router.GET("/api/v1/audit-logs",
+        chain(deps.AuditHandler.List, auth, tenant, requireRole("admin", "owner")))
+    
+    // CORS middleware for all routes
+    return wrapWithCORS(router)
+}
+
+// Helper function to chain middlewares
+func chain(handler http.HandlerFunc, middlewares ...func(http.HandlerFunc) http.HandlerFunc) httprouter.Handle {
+    for i := len(middlewares) - 1; i >= 0; i-- {
+        handler = middlewares[i](handler)
+    }
+    return wrap(handler)
+}
+
+// Convert http.HandlerFunc to httprouter.Handle
+func wrap(handler http.HandlerFunc) httprouter.Handle {
+    return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+        // Inject params into context
+        ctx := context.WithValue(r.Context(), "params", ps)
+        handler(w, r.WithContext(ctx))
+    }
+}
+
+func requireRole(roles ...string) func(http.HandlerFunc) http.HandlerFunc {
+    return func(next http.HandlerFunc) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+            claims := r.Context().Value("claims").(*Claims)
+            
+            allowed := false
+            for _, role := range roles {
+                if claims.Role == role {
+                    allowed = true
+                    break
+                }
+            }
+            
+            if !allowed {
+                http.Error(w, "Forbidden", http.StatusForbidden)
+                return
+            }
+            
+            next(w, r)
+        }
+    }
+}
+
+func rateLimit(limitType string) func(http.HandlerFunc) http.HandlerFunc {
+    return func(next http.HandlerFunc) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+            tenant := r.Context().Value("tenant").(*TenantContext)
+            key := fmt.Sprintf("%s:%s", tenant.OrgID, limitType)
+            
+            if !rateLimiter.Allow(key, rateLimits[limitType]) {
+                w.Header().Set("Retry-After", "60")
+                http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+                return
+            }
+            
+            next(w, r)
+        }
+    }
+}
+```
+
+---
+
+## 17. AUDIT LOGGING
+
+```go
+type AuditLog struct {
+    ID             string
+    OrganizationID string
+    UserID         string
+    Action         string // "link.created", "user.invited", "org.updated"
+    ResourceType   string // "link", "user", "organization"
+    ResourceID     string
+    Metadata       map[string]interface{}
+    IPAddress      string
+    UserAgent      string
+    CreatedAt      int64
+}
+
+func LogAudit(ctx context.Context, action, resourceType, resourceID string, metadata map[string]interface{}) {
+    claims := ctx.Value("claims").(*Claims)
+    tenant := ctx.Value("tenant").(*TenantContext)
+    
+    r := ctx.Value("request").(*http.Request)
+    
+    log := &AuditLog{
+        ID:             generateUUID(),
+        OrganizationID: tenant.OrgID,
+        UserID:         claims.UserID,
+        Action:         action,
+        ResourceType:   resourceType,
+        ResourceID:     resourceID,
+        Metadata:       metadata,
+        IPAddress:      extractIP(r),
+        UserAgent:      r.UserAgent(),
+        CreatedAt:      time.Now().Unix(),
+    }
+    
+    // Async insert
+    go func() {
+        if err := auditRepo.Insert(log); err != nil {
+            logger.Error("Failed to log audit event", "error", err)
+        }
+    }()
+}
+
+// Usage in handlers
+func (h *LinkHandler) Create(w http.ResponseWriter, r *http.Request) {
+    // ... create link logic ...
+    
+    LogAudit(r.Context(), "link.created", "link", link.ID, map[string]interface{}{
+        "short_code":      link.ShortCode,
+        "destination_url": link.DestinationURL,
+    })
+    
+    // ... return response
+}
+```
+
+---
+
+## 18. SYSTEMD SERVICE CONFIGURATION
+
+```ini
+# /etc/systemd/system/trackr.service
+[Unit]
+Description=Trackr Link Management Platform
+After=network.target
+
+[Service]
+Type=simple
+User=trackr
+Group=trackr
+WorkingDirectory=/opt/trackr
+ExecStart=/opt/trackr/bin/trackr-server
+Restart=always
+RestartSec=10
+
+# Environment
+Environment="TURSO_DB_URL=libsql://..."
+Environment="TURSO_AUTH_TOKEN=..."
+EnvironmentFile=/etc/trackr/env
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trackr /var/log/trackr
+
+# Limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/trackr-worker.service
+[Unit]
+Description=Trackr Background Workers
+After=network.target trackr.service
+
+[Service]
+Type=simple
+User=trackr
+Group=trackr
+WorkingDirectory=/opt/trackr
+ExecStart=/opt/trackr/bin/trackr-worker
+Restart=always
+RestartSec=10
+
+EnvironmentFile=/etc/trackr/env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 19. MAKEFILE
+
+```makefile
+# Makefile
+
+.PHONY: build run test clean migrate-global migrate-tenant install
+
+# Variables
+BINARY_NAME=trackr
+WORKER_BINARY=trackr-worker
+MIGRATE_BINARY=trackr-migrate
+GO=go
+GOFLAGS=-v
+
+# Build
+build:
+	$(GO) build $(GOFLAGS) -o bin/$(BINARY_NAME) cmd/server/main.go
+	$(GO) build $(GOFLAGS) -o bin/$(WORKER_BINARY) cmd/worker/main.go
+	$(GO) build $(GOFLAGS) -o bin/$(MIGRATE_BINARY) cmd/migrate/main.go
+
+# Run locally
+run:
+	$(GO) run cmd/server/main.go
+
+# Run with hot reload (requires air)
+dev:
+	air -c .air.toml
+
+# Tests
+test:
+	$(GO) test -v -race -coverprofile=coverage.out ./...
+
+test-coverage:
+	$(GO) tool cover -html=coverage.out -o coverage.html
+
+# Benchmarks
+bench:
+	$(GO) test -bench=. -benchmem ./internal/engine/redirect/
+
+# Database migrations
+migrate-global-up:
+	./bin/$(MIGRATE_BINARY) --target=global --direction=up
+
+migrate-global-down:
+	./bin/$(MIGRATE_BINARY) --target=global --direction=down
+
+migrate-tenant-up:
+	./bin/$(MIGRATE_BINARY) --target=tenant --org=$(ORG_ID) --direction=up
+
+# Linting
+lint:
+	golangci-lint run
+
+# Format code
+fmt:
+	$(GO) fmt ./...
+	goimports -w .
+
+# Clean
+clean:
+	rm -rf bin/
+	rm -f coverage.out coverage.html
+
+# Install dependencies
+deps:
+	$(GO) mod download
+	$(GO) mod tidy
+
+# Build for production
+build-prod:
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(GO) build -ldflags="-s -w" -o bin/$(BINARY_NAME) cmd/server/main.go
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(GO) build -ldflags="-s -w" -o bin/$(WORKER_BINARY) cmd/worker/main.go
+
+# Docker build
+docker-build:
+	docker build -t trackr:latest .
+
+# Deploy
+deploy:
+	scp bin/$(BINARY_NAME) user@server:/opt/trackr/bin/
+	ssh user@server 'sudo systemctl restart trackr'
+```
+
+---
+
+## 20. IMPLEMENTATION CHECKLIST
+
+### Phase 1: Core Infrastructure
+- [ ] Initialize Go project with proper module structure
+- [ ] Set up Turso global database connection
+- [ ] Implement SQLite tenant database manager
+- [ ] Create database migration system
+- [ ] Set up configuration management (Viper/env)
+- [ ] Implement logging infrastructure (structured logging)
+- [ ] Set up error handling patterns
+
+### Phase 2: Authentication & Authorization
+- [ ] Implement JWT token generation and validation
+- [ ] Build invite code system
+- [ ] Create corporate email validator
+- [ ] Implement RBAC middleware
+- [ ] Build user registration flow
+- [ ] Build user login flow
+- [ ] Implement refresh token mechanism
+- [ ] Add SAML 2.0 integration
+- [ ] Build SAML metadata endpoint
+
+### Phase 3: Multi-Tenant Architecture
+- [ ] Implement tenant context middleware
+- [ ] Build tenant database connection pooling
+- [ ] Create organization onboarding flow
+- [ ] Implement domain verification system
+- [ ] Build tenant isolation tests
+
+### Phase 4: Link Management
+- [ ] Implement short code generator
+- [ ] Build link CRUD operations
+- [ ] Create link validation logic
+- [ ] Implement rules engine (geo/device)
+- [ ] Add UTM parameter handling
+- [ ] Build link expiry mechanism
+- [ ] Implement password-protected links
+
+### Phase 5: High-Performance Redirect Engine
+- [ ] Build in-memory link cache
+- [ ] Implement redirect handler
+- [ ] Create async click logger
+- [ ] Integrate GeoIP lookup
+- [ ] Build user-agent parser
+- [ ] Implement referrer extraction
+- [ ] Add redirect performance metrics
+- [ ] Optimize SQLite queries with prepared statements
+
+### Phase 6: Analytics System
+- [ ] Build click event storage
+- [ ] Implement daily stats aggregation worker
+- [ ] Create analytics query API
+- [ ] Build time-series aggregation
+- [ ] Implement geographic analytics
+- [ ] Add device/browser analytics
+- [ ] Create referrer analytics
+- [ ] Build UTM parameter tracking
+
+### Phase 7: API & Webhooks
+- [ ] Build REST API with httprouter
+- [ ] Implement API key system
+- [ ] Add rate limiting middleware
+- [ ] Create webhook dispatcher
+- [ ] Build webhook retry mechanism
+- [ ] Implement HMAC signature verification
+- [ ] Add webhook management API
+
+### Phase 8: QR Codes & Utilities
+- [ ] Implement QR code generator
+- [ ] Build QR code caching
+- [ ] Add QR code customization options
+
+### Phase 9: Operations & Monitoring
+- [ ] Create health check endpoint
+- [ ] Implement Prometheus metrics
+- [ ] Build audit logging system
+- [ ] Create backup scripts
+- [ ] Write deployment automation
+- [ ] Set up systemd services
+- [ ] Configure Caddy reverse proxy
+
+### Phase 10: Testing & Documentation
+- [ ] Write unit tests for core logic
+- [ ] Create integration tests
+- [ ] Build performance benchmarks
+- [ ] Write API documentation
+- [ ] Create deployment guide
+- [ ] Write operations runbook
+
+---
+
+## FINAL NOTES
+
+This plan provides a complete blueprint for building Trackr as an enterprise-grade link management platform. Key architectural decisions:
+
+1. **Split-Brain Architecture**: Global Turso DB for cross-tenant data + local SQLite per organization ensures data isolation and performance
+2. **Sub-50ms Redirects**: In-memory cache → SQLite → async logging achieves target latency
+3. **Enterprise-First**: Invite-only, corporate email validation, SAML SSO, and RBAC from day one
+4. **Scalable Design**: Connection pooling, prepared statements, batch inserts, and worker processes handle growth
+5. **Production-Ready**: Comprehensive error handling, audit logs, metrics, and operational tooling
+
+The implementation should be done incrementally following the phases, with each phase fully tested before moving to the next. All database queries use parameterized statements to prevent SQL injection, and all user inputs are validated before processing.
