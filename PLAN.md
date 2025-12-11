@@ -3722,35 +3722,43 @@ deploy:
 - [x] Build UTM parameter tracking
 
 ### Phase 7: API & Webhooks
-- [ ] Build REST API with httprouter
-- [ ] Implement API key system
-- [ ] Add rate limiting middleware
-- [ ] Create webhook dispatcher
-- [ ] Build webhook retry mechanism
-- [ ] Implement HMAC signature verification
-- [ ] Add webhook management API
+- [x] Build REST API with httprouter
+- [x] Implement API key system
+- [x] Add rate limiting middleware
+- [x] Create webhook dispatcher
+- [x] Build webhook retry mechanism
+- [x] Implement HMAC signature verification
+- [x] Add webhook management API
 
 ### Phase 8: QR Codes & Utilities
-- [ ] Implement QR code generator
-- [ ] Build QR code caching
-- [ ] Add QR code customization options
+- [x] Implement QR code generator
+- [x] Build QR code caching
+- [x] Add QR code customization options
 
 ### Phase 9: Operations & Monitoring
-- [ ] Create health check endpoint
-- [ ] Implement Prometheus metrics
-- [ ] Build audit logging system
-- [ ] Create backup scripts
-- [ ] Write deployment automation
-- [ ] Set up systemd services
-- [ ] Configure Caddy reverse proxy
+- [x] Create health check endpoint
+- [x] Implement Prometheus metrics
+- [x] Build audit logging system
+- [x] Create backup scripts
+- [x] Write deployment automation
+- [x] Set up systemd services
+- [x] Configure Caddy reverse proxy
 
 ### Phase 10: Testing & Documentation
-- [ ] Write unit tests for core logic
+- [x] Write unit tests for core logic
 - [ ] Create integration tests
 - [ ] Build performance benchmarks
 - [ ] Write API documentation
 - [ ] Create deployment guide
 - [ ] Write operations runbook
+
+### Phase 11: API Request/Response Examples
+- [x] Define Request/Response examples in PLAN.md
+
+### Phase 12: Worker Processes
+- [x] Implement Stats Aggregation Worker
+- [x] Implement Webhook Retry Worker
+- [x] Implement Link Expiry Worker
 
 ---
 

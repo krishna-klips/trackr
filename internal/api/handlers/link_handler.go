@@ -153,6 +153,33 @@ func (h *LinkHandler) Delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *LinkHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
-	// Placeholder for QR code generation
-	w.WriteHeader(http.StatusNotImplemented)
+	tenantCtx := r.Context().Value("tenant").(*database.TenantContext)
+	params := r.Context().Value("params").(httprouter.Params)
+	linkID := params.ByName("link_id")
+
+	repo := links.NewRepository(tenantCtx.DB)
+	service := links.NewService(repo)
+
+	link, err := service.GetLink(linkID)
+	if err != nil {
+		http.Error(w, "Link not found", http.StatusNotFound)
+		return
+	}
+
+	// Assuming short domain is in config or constructed.
+	// For now, let's hardcode the domain or retrieve from context if available.
+	// Ideally, it comes from config.
+	shortURL := "https://trk.io/" + link.ShortCode // Should be configurable
+
+	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+
+	qrBytes, err := links.GenerateQRCode(shortURL, size)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=31536000") // 1 year
+	w.Write(qrBytes)
 }

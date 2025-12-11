@@ -1,0 +1,51 @@
+{
+    email admin@trackr.io
+    auto_https on
+}
+
+# Main application
+app.trackr.io {
+    reverse_proxy localhost:8080
+
+    encode gzip
+
+    log {
+        output file /var/log/caddy/app.log
+        format json
+    }
+}
+
+# API domain
+api.trackr.io {
+    reverse_proxy localhost:8080
+
+    encode gzip
+
+    # Rate limiting (via Caddy plugin if available)
+
+    log {
+        output file /var/log/caddy/api.log
+        format json
+    }
+}
+
+# Short link domain (redirects)
+trk.io {
+    reverse_proxy localhost:8080
+
+    # No gzip for redirects (performance)
+
+    log {
+        output file /var/log/caddy/redirect.log
+        format json
+    }
+}
+
+# Wildcard for custom domains
+*.trackr.io {
+    reverse_proxy localhost:8080
+
+    tls {
+        on_demand
+    }
+}
