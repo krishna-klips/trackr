@@ -13,16 +13,22 @@ import (
 )
 
 type Dependencies struct {
-	AuthHandler     *handlers.AuthHandler
-	OrgHandler      *handlers.OrgHandler
-	InviteHandler   *handlers.InviteHandler
-	UserHandler     *handlers.UserHandler
-	AuthMiddleware  *middleware.AuthMiddleware
-	TenantMiddleware *middleware.TenantMiddleware
+	AuthHandler       *handlers.AuthHandler
+	OrgHandler        *handlers.OrgHandler
+	InviteHandler     *handlers.InviteHandler
+	UserHandler       *handlers.UserHandler
+	LinkHandler       *handlers.LinkHandler
+	AnalyticsHandler  *handlers.AnalyticsHandler
+	RedirectHandler   *handlers.RedirectHandler
+	AuthMiddleware    *middleware.AuthMiddleware
+	TenantMiddleware  *middleware.TenantMiddleware
 }
 
 func NewRouter(deps *Dependencies) *httprouter.Router {
 	router := httprouter.New()
+
+	// Public Redirect Endpoint
+	router.GET("/:short_code", wrap(deps.RedirectHandler.Handle))
 
 	// Authentication routes
 	router.POST("/api/v1/auth/signup", wrap(deps.AuthHandler.Signup))
@@ -73,6 +79,28 @@ func NewRouter(deps *Dependencies) *httprouter.Router {
 		chain(deps.UserHandler.UpdateRole, authMid.Handle, tenantMid.Handle, requireRole("owner")))
 	router.DELETE("/api/v1/users/:user_id",
 		chain(deps.UserHandler.Delete, authMid.Handle, tenantMid.Handle, requireRole("owner")))
+
+	// Link management
+	router.POST("/api/v1/links",
+		chain(deps.LinkHandler.Create, authMid.Handle, tenantMid.Handle))
+	router.GET("/api/v1/links",
+		chain(deps.LinkHandler.List, authMid.Handle, tenantMid.Handle))
+	router.GET("/api/v1/links/:link_id",
+		chain(deps.LinkHandler.Get, authMid.Handle, tenantMid.Handle))
+	router.PATCH("/api/v1/links/:link_id",
+		chain(deps.LinkHandler.Update, authMid.Handle, tenantMid.Handle))
+	router.DELETE("/api/v1/links/:link_id",
+		chain(deps.LinkHandler.Delete, authMid.Handle, tenantMid.Handle))
+	router.GET("/api/v1/links/:link_id/qr",
+		chain(deps.LinkHandler.GetQRCode, authMid.Handle, tenantMid.Handle))
+
+	// Analytics
+	router.GET("/api/v1/links/:link_id/analytics",
+		chain(deps.AnalyticsHandler.GetLinkAnalytics, authMid.Handle, tenantMid.Handle))
+	router.GET("/api/v1/links/:link_id/clicks",
+		chain(deps.AnalyticsHandler.GetLinkClicks, authMid.Handle, tenantMid.Handle))
+	router.GET("/api/v1/analytics/overview",
+		chain(deps.AnalyticsHandler.GetOverview, authMid.Handle, tenantMid.Handle))
 
 	return router
 }
