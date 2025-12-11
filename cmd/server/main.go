@@ -30,6 +30,9 @@ func main() {
 	}
 	defer globalDB.Close()
 
+	// Wrapper for global DB injection
+	globalDBWrapper := database.NewGlobalDBWrapper(globalDB)
+
 	tenantDBPool := database.NewTenantDBPool(cfg.Database.Tenant)
 	defer tenantDBPool.CloseAll()
 
@@ -47,6 +50,19 @@ func main() {
 	inviteHandler := handlers.NewInviteHandler(inviteRepo)
 	userHandler := handlers.NewUserHandler()
 
+	// New Handlers
+	linkHandler := handlers.NewLinkHandler() // Dependencies resolved via context in handler
+	analyticsHandler := handlers.NewAnalyticsHandler() // Dependencies resolved via context
+
+	// Correctly initialize RedirectHandler with dependencies
+	redirectHandler := handlers.NewRedirectHandler(globalDB, tenantDBPool, cfg.Domains.ShortDomain)
+
+	webhookHandler := handlers.NewWebhookHandler()
+	apiKeyHandler := handlers.NewAPIKeyHandler(globalDBWrapper)
+	healthHandler := handlers.NewHealthHandler(globalDBWrapper)
+	metricsHandler := handlers.NewMetricsHandler()
+	auditHandler := handlers.NewAuditHandler(globalDBWrapper)
+
 	// Middleware
 	authMiddleware := middleware.NewAuthMiddleware(tokenSvc)
 	tenantMiddleware := middleware.NewTenantMiddleware(orgRepo, tenantDBPool)
@@ -57,6 +73,14 @@ func main() {
 		OrgHandler:       orgHandler,
 		InviteHandler:    inviteHandler,
 		UserHandler:      userHandler,
+		LinkHandler:      linkHandler,
+		AnalyticsHandler: analyticsHandler,
+		RedirectHandler:  redirectHandler,
+		WebhookHandler:   webhookHandler,
+		APIKeyHandler:    apiKeyHandler,
+		HealthHandler:    healthHandler,
+		MetricsHandler:   metricsHandler,
+		AuditHandler:     auditHandler,
 		AuthMiddleware:   authMiddleware,
 		TenantMiddleware: tenantMiddleware,
 	}

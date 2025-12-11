@@ -1,0 +1,32 @@
+# /etc/systemd/system/trackr.service
+[Unit]
+Description=Trackr Link Management Platform
+After=network.target
+
+[Service]
+Type=simple
+User=trackr
+Group=trackr
+WorkingDirectory=/opt/trackr
+ExecStart=/opt/trackr/bin/trackr-server
+Restart=always
+RestartSec=10
+
+# Environment
+Environment="TURSO_DB_URL=libsql://..."
+Environment="TURSO_AUTH_TOKEN=..."
+EnvironmentFile=/etc/trackr/env
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trackr /var/log/trackr
+
+# Limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

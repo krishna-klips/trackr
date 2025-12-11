@@ -20,12 +20,21 @@ type Dependencies struct {
 	LinkHandler       *handlers.LinkHandler
 	AnalyticsHandler  *handlers.AnalyticsHandler
 	RedirectHandler   *handlers.RedirectHandler
+	WebhookHandler    *handlers.WebhookHandler
+	APIKeyHandler     *handlers.APIKeyHandler
+	HealthHandler     *handlers.HealthHandler
+	MetricsHandler    *handlers.MetricsHandler
+	AuditHandler      *handlers.AuditHandler
 	AuthMiddleware    *middleware.AuthMiddleware
 	TenantMiddleware  *middleware.TenantMiddleware
 }
 
 func NewRouter(deps *Dependencies) *httprouter.Router {
 	router := httprouter.New()
+
+	// Health & Metrics
+	router.GET("/health", wrap(deps.HealthHandler.Check))
+	router.GET("/metrics", wrap(deps.MetricsHandler.Export))
 
 	// Public Redirect Endpoint
 	router.GET("/:short_code", wrap(deps.RedirectHandler.Handle))
@@ -44,6 +53,7 @@ func NewRouter(deps *Dependencies) *httprouter.Router {
 	// Middleware references
 	authMid := deps.AuthMiddleware
 	tenantMid := deps.TenantMiddleware
+	rateMid := middleware.RateLimit
 
 	// Organization management
 	router.POST("/api/v1/organizations", wrap(deps.OrgHandler.Create))
@@ -82,25 +92,49 @@ func NewRouter(deps *Dependencies) *httprouter.Router {
 
 	// Link management
 	router.POST("/api/v1/links",
-		chain(deps.LinkHandler.Create, authMid.Handle, tenantMid.Handle))
+		chain(deps.LinkHandler.Create, authMid.Handle, tenantMid.Handle, rateMid("api_write")))
 	router.GET("/api/v1/links",
-		chain(deps.LinkHandler.List, authMid.Handle, tenantMid.Handle))
+		chain(deps.LinkHandler.List, authMid.Handle, tenantMid.Handle, rateMid("api_read")))
 	router.GET("/api/v1/links/:link_id",
-		chain(deps.LinkHandler.Get, authMid.Handle, tenantMid.Handle))
+		chain(deps.LinkHandler.Get, authMid.Handle, tenantMid.Handle, rateMid("api_read")))
 	router.PATCH("/api/v1/links/:link_id",
-		chain(deps.LinkHandler.Update, authMid.Handle, tenantMid.Handle))
+		chain(deps.LinkHandler.Update, authMid.Handle, tenantMid.Handle, rateMid("api_write")))
 	router.DELETE("/api/v1/links/:link_id",
-		chain(deps.LinkHandler.Delete, authMid.Handle, tenantMid.Handle))
+		chain(deps.LinkHandler.Delete, authMid.Handle, tenantMid.Handle, rateMid("api_write")))
 	router.GET("/api/v1/links/:link_id/qr",
-		chain(deps.LinkHandler.GetQRCode, authMid.Handle, tenantMid.Handle))
+		chain(deps.LinkHandler.GetQRCode, authMid.Handle, tenantMid.Handle, rateMid("api_read")))
 
 	// Analytics
 	router.GET("/api/v1/links/:link_id/analytics",
-		chain(deps.AnalyticsHandler.GetLinkAnalytics, authMid.Handle, tenantMid.Handle))
+		chain(deps.AnalyticsHandler.GetLinkAnalytics, authMid.Handle, tenantMid.Handle, rateMid("analytics")))
 	router.GET("/api/v1/links/:link_id/clicks",
-		chain(deps.AnalyticsHandler.GetLinkClicks, authMid.Handle, tenantMid.Handle))
+		chain(deps.AnalyticsHandler.GetLinkClicks, authMid.Handle, tenantMid.Handle, rateMid("analytics")))
 	router.GET("/api/v1/analytics/overview",
-		chain(deps.AnalyticsHandler.GetOverview, authMid.Handle, tenantMid.Handle))
+		chain(deps.AnalyticsHandler.GetOverview, authMid.Handle, tenantMid.Handle, rateMid("analytics")))
+
+	// Webhooks
+	router.POST("/api/v1/webhooks",
+		chain(deps.WebhookHandler.Create, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+	router.GET("/api/v1/webhooks",
+		chain(deps.WebhookHandler.List, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+	router.GET("/api/v1/webhooks/:webhook_id",
+		chain(deps.WebhookHandler.Get, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+	router.PATCH("/api/v1/webhooks/:webhook_id",
+		chain(deps.WebhookHandler.Update, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+	router.DELETE("/api/v1/webhooks/:webhook_id",
+		chain(deps.WebhookHandler.Delete, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+
+	// API Keys
+	router.POST("/api/v1/api-keys",
+		chain(deps.APIKeyHandler.Create, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+	router.GET("/api/v1/api-keys",
+		chain(deps.APIKeyHandler.List, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+	router.DELETE("/api/v1/api-keys/:key_id",
+		chain(deps.APIKeyHandler.Revoke, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
+
+	// Audit logs
+	router.GET("/api/v1/audit-logs",
+		chain(deps.AuditHandler.List, authMid.Handle, tenantMid.Handle, requireRole("admin", "owner")))
 
 	return router
 }

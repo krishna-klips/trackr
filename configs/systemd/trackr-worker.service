@@ -1,0 +1,18 @@
+# /etc/systemd/system/trackr-worker.service
+[Unit]
+Description=Trackr Background Workers
+After=network.target trackr.service
+
+[Service]
+Type=simple
+User=trackr
+Group=trackr
+WorkingDirectory=/opt/trackr
+ExecStart=/opt/trackr/bin/trackr-worker
+Restart=always
+RestartSec=10
+
+EnvironmentFile=/etc/trackr/env
+
+[Install]
+WantedBy=multi-user.target
